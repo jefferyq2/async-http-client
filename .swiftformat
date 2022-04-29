@@ -1,6 +1,6 @@
 # file options
 
---swiftversion 5.2
+--swiftversion 5.4
 --exclude .build
 
 # format options
@@ -19,5 +19,6 @@
 --disable redundantReturn
 --disable preferKeyPath
 --disable sortedSwitchCases
+--disable numberFormatting
 
 # rules

@@ -154,8 +154,11 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
             return self.task.eventLoop.makeFailedFuture(error)
 
         case .write(let part, let writer, let future):
-            writer.writeRequestBodyPart(part, request: self)
-            self.delegate.didSendRequestPart(task: self.task, part)
+            let promise = self.task.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenSuccess {
+                self.delegate.didSendRequestPart(task: self.task, part)
+            }
+            writer.writeRequestBodyPart(part, request: self, promise: promise)
             return future
         }
     }
@@ -168,11 +171,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
         switch action {
         case .none:
             break
-        case .forwardStreamFinished(let writer, let promise):
-            writer.finishRequestBodyStream(self)
-            promise?.succeed(())
-
-            self.delegate.didSendRequest(task: self.task)
+        case .forwardStreamFinished(let writer, let writerPromise):
+            let promise = writerPromise ?? self.task.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenSuccess {
+                self.delegate.didSendRequest(task: self.task)
+            }
+            writer.finishRequestBodyStream(self, promise: promise)
 
         case .forwardStreamFailureAndFailTask(let writer, let error, let promise):
             writer.cancelRequest(self)
@@ -196,33 +200,49 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
         self.task.eventLoop.assertInEventLoop()
 
         // runs most likely on channel eventLoop
-        let forwardToDelegate = self.state.receiveResponseHead(head)
+        switch self.state.receiveResponseHead(head) {
+        case .none:
+            break
 
-        guard forwardToDelegate else { return }
+        case .signalBodyDemand(let executor):
+            executor.demandResponseBodyStream(self)
 
-        self.delegate.didReceiveHead(task: self.task, head)
-            .hop(to: self.task.eventLoop)
-            .whenComplete { result in
-                // After the head received, let's start to consume body data
-                self.consumeMoreBodyData0(resultOfPreviousConsume: result)
-            }
+        case .redirect(let executor, let handler, let head, let newURL):
+            handler.redirect(status: head.status, to: newURL, promise: self.task.promise)
+            executor.cancelRequest(self)
+
+        case .forwardResponseHead(let head):
+            self.delegate.didReceiveHead(task: self.task, head)
+                .hop(to: self.task.eventLoop)
+                .whenComplete { result in
+                    // After the head received, let's start to consume body data
+                    self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                }
+        }
     }
 
     private func receiveResponseBodyParts0(_ buffer: CircularBuffer<ByteBuffer>) {
         self.task.eventLoop.assertInEventLoop()
 
-        let maybeForwardBuffer = self.state.receiveResponseBodyParts(buffer)
+        switch self.state.receiveResponseBodyParts(buffer) {
+        case .none:
+            break
 
-        guard let forwardBuffer = maybeForwardBuffer else {
-            return
+        case .signalBodyDemand(let executor):
+            executor.demandResponseBodyStream(self)
+
+        case .redirect(let executor, let handler, let head, let newURL):
+            handler.redirect(status: head.status, to: newURL, promise: self.task.promise)
+            executor.cancelRequest(self)
+
+        case .forwardResponsePart(let part):
+            self.delegate.didReceiveBodyPart(task: self.task, part)
+                .hop(to: self.task.eventLoop)
+                .whenComplete { result in
+                    // on task el
+                    self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                }
         }
-
-        self.delegate.didReceiveBodyPart(task: self.task, forwardBuffer)
-            .hop(to: self.task.eventLoop)
-            .whenComplete { result in
-                // on task el
-                self.consumeMoreBodyData0(resultOfPreviousConsume: result)
-            }
     }
 
     private func succeedRequest0(_ buffer: CircularBuffer<ByteBuffer>?) {
